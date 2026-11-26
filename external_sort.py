@@ -955,6 +955,8 @@ def compact_versions(selected, untouched, *, snapshots=(), run_rows=128,
 
 _EXCHANGE_ROW_LIMIT = 200_000
 _EXCHANGE_MAX_BUDGET = 16 * 1024 * 1024
+_EXCHANGE_MAX_DELIVERY = 1024 * 1024
+_EXCHANGE_MAX_PAGE_ROWS = 128
 _EXCHANGE_MIN_KEY = -(1 << 63)
 _EXCHANGE_MAX_KEY_EXCLUSIVE = 1 << 63
 _EXCHANGE_COMMIT_ROWS = 128
@@ -966,6 +968,14 @@ _EXCHANGE_SELECT_RESTRICTED = (
 _EXCHANGE_SELECT_ALL = (
     "SELECT shard, seq, key, payload FROM exchange_rows "
     "ORDER BY key, shard, seq LIMIT 1"
+)
+_EXCHANGE_SELECT_RESTRICTED_PAGE = (
+    "SELECT shard, seq, key, payload FROM exchange_rows "
+    "WHERE key < ? ORDER BY key, shard, seq LIMIT ?"
+)
+_EXCHANGE_SELECT_ALL_PAGE = (
+    "SELECT shard, seq, key, payload FROM exchange_rows "
+    "ORDER BY key, shard, seq LIMIT ?"
 )
 _EXCHANGE_INSERT = (
     "INSERT INTO exchange_rows (key, shard, seq, payload) "
@@ -979,11 +989,15 @@ _EXCHANGE_DELETE = (
 class ordered_exchange:
     """Incremental, disk-backed ordered exchange; use as a context manager."""
 
-    def __init__(self, reserved_bytes, *, shared_bytes, scratch=None):
+    def __init__(self, reserved_bytes, *, shared_bytes, scratch=None,
+                 publisher=None, page_rows=128, delivery_bytes=0):
         # Values are snapshotted by __enter__, as required by the API.
         self._reserved_arg = reserved_bytes
         self._shared_arg = shared_bytes
         self._scratch_arg = scratch
+        self._publisher_arg = publisher
+        self._page_rows_arg = page_rows
+        self._delivery_arg = delivery_bytes
         self._open = False
         self._entered = False
         self._root = None
@@ -1011,6 +1025,19 @@ class ordered_exchange:
         if sum(reserved) + shared > _EXCHANGE_MAX_BUDGET:
             raise ValueError("total exchange budget may not exceed 16 MiB")
 
+        publisher = self._publisher_arg
+        if publisher is not None and not callable(publisher):
+            raise ValueError("publisher must be None or callable")
+        page_rows = self._page_rows_arg
+        if type(page_rows) is not int or not (
+                1 <= page_rows <= _EXCHANGE_MAX_PAGE_ROWS):
+            raise ValueError("page_rows must be an integer from 1 to 128")
+        delivery = self._delivery_arg
+        if type(delivery) is not int or not (
+                0 <= delivery <= _EXCHANGE_MAX_DELIVERY):
+            raise ValueError(
+                "delivery_bytes must be an integer from 0 to 1 MiB")
+
         self._shard_count = len(reserved)
         self._reserved = reserved
         self._shared_budget = shared
@@ -1023,6 +1050,13 @@ class ordered_exchange:
         self._received = 0
         self._mutations = 0
         self._uncommitted_deletes = 0
+
+        self._publisher = publisher
+        self._page_rows = page_rows
+        self._delivery_budget = delivery
+        self._delivery_used = 0
+        self._page_id = 0
+        self._pending_page = None  # (page_id, rows, transferred, cost)
 
         self._tempdir = TemporaryDirectory(
             dir=self._scratch_arg, prefix="ordered-exchange-")
@@ -1070,6 +1104,7 @@ class ordered_exchange:
     def close(self):
         """Close SQLite handles and remove this exchange's private directory."""
         self._open = False
+        self._pending_page = None
         conn = self._conn
         tempdir = self._tempdir
         self._conn = None
@@ -1190,6 +1225,9 @@ class ordered_exchange:
     def take(self):
         """Return the next globally safe ``(shard, seq, Row)`` or None."""
         self._require_open()
+        if self._publisher is not None:
+            raise RuntimeError(
+                "take() is unavailable when a publisher is configured")
 
         if all(self._finished):
             self._cursor.execute(_EXCHANGE_SELECT_ALL)
@@ -1223,10 +1261,124 @@ class ordered_exchange:
 
         return index, seq, Row(key, payload.decode("utf-8"))
 
-    def done(self):
-        """True only when every shard is finished and no rows are pending."""
+    def flush(self):
+        """Publish at most one page of safe rows through the configured loader.
+
+        Returns the number of rows the loader confirmed for this call, or 0
+        when no safe rows were available.  An exception from the loader is
+        propagated unchanged and leaves exactly one page pending for an
+        identical retry.
+        """
         self._require_open()
-        complete = self._pending == 0 and all(self._finished)
+        if self._publisher is None:
+            raise RuntimeError(
+                "flush() requires a publisher on ordered_exchange")
+
+        page = self._pending_page
+        if page is None:
+            page = self._build_page()
+            if page is None:
+                return 0
+            self._pending_page = page
+
+        page_id, rows, transferred, costs = page
+        # The loader must either write the whole page or nothing; any failure
+        # leaves the same page identity, order and payload available to retry.
+        self._publisher(page_id, rows)
+        self._confirm_page(page_id, rows, transferred, costs)
+        self._pending_page = None
+        self._page_id += 1
+        return len(rows)
+
+    def _build_page(self):
+        """Select the next safe page, reserving its retry capacity."""
+        all_finished = all(self._finished)
+        if all_finished:
+            self._cursor.execute(
+                _EXCHANGE_SELECT_ALL_PAGE, (self._page_rows,))
+        else:
+            safety_bound = min(
+                bound for bound, finished in zip(
+                    self._lower_bounds, self._finished)
+                if not finished
+            )
+            self._cursor.execute(
+                _EXCHANGE_SELECT_RESTRICTED_PAGE,
+                (safety_bound, self._page_rows))
+
+        records = self._cursor.fetchall()
+        if not records:
+            self._commit_drained_deletes()
+            return None
+
+        rows = []
+        costs = []
+        page_cost = 0
+        for index, seq, key, payload in records:
+            cost = 32 + len(payload)
+            rows.append((index, seq, Row(key, payload.decode("utf-8"))))
+            costs.append((index, cost))
+            page_cost += cost
+        rows = tuple(rows)
+
+        # Retry safety: either the whole page keeps its existing share of the
+        # production budget, or it is transferred as a unit to the independent
+        # delivery retention budget so the production budget can be released
+        # immediately.  Pages are never split between the two budgets.
+        transferred = page_cost <= self._delivery_budget - self._delivery_used
+        if transferred:
+            self._detach_from_production(costs)
+            self._delivery_used += page_cost
+        return (self._page_id, rows, transferred, tuple(costs))
+
+    def _detach_from_production(self, costs):
+        """Remove a whole page's rows from the shard/shared budget accounting."""
+        per_shard = {}
+        for index, cost in costs:
+            per_shard[index] = per_shard.get(index, 0) + cost
+        for index, cost in per_shard.items():
+            old_balance = self._balances[index]
+            reserve = self._reserved[index]
+            old_overflow = max(0, old_balance - reserve)
+            new_balance = old_balance - cost
+            new_overflow = max(0, new_balance - reserve)
+            self._balances[index] = new_balance
+            self._shared_used += new_overflow - old_overflow
+
+    def _confirm_page(self, page_id, rows, transferred, costs):
+        """Record a committed page and release exactly what it still holds."""
+        for index, seq, row in rows:
+            self._cursor.execute(
+                _EXCHANGE_DELETE, (row.key, index, seq))
+
+        if transferred:
+            page_cost = sum(cost for _, cost in costs)
+            self._delivery_used -= page_cost
+        else:
+            per_shard = {}
+            for index, cost in costs:
+                per_shard[index] = per_shard.get(index, 0) + cost
+            for index, cost in per_shard.items():
+                old_balance = self._balances[index]
+                reserve = self._reserved[index]
+                old_overflow = max(0, old_balance - reserve)
+                new_balance = old_balance - cost
+                new_overflow = max(0, new_balance - reserve)
+                self._balances[index] = new_balance
+                self._shared_used += new_overflow - old_overflow
+
+        self._pending -= len(rows)
+        for _ in rows:
+            self._note_mutation(delete=True)
+
+    def done(self):
+        """True only when every shard is finished and nothing is left to ship."""
+        self._require_open()
+        complete = (
+            self._pending == 0
+            and self._pending_page is None
+            and all(self._finished)
+        )
         if complete and self._uncommitted_deletes:
             self._commit()
         return complete

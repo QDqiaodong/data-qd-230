@@ -109,4 +109,37 @@ UTF-8 字节），由主键完成排序，删除提交后以 `auto_vacuum=FULL` 
 生成、不累积已消费负载时，Python 可跟踪分配峰值远低于 8 MiB，存活暂存字节也低于
 64 MiB。退出上下文会关闭连接并删除本次私有目录，不删除 scratch 中的调用方原有文件。
 
+### 向下游装载器发布有序页
+
+```py
+with ordered_exchange([reserve_0, reserve_1], shared_bytes=...,
+                      scratch=None, publisher=load, page_rows=128,
+                      delivery_bytes=0) as exchange:
+    exchange.offer(shard, Row(key, payload))
+    exchange.advance(shard, lower_bound)
+    confirmed = exchange.flush()   # loader-confirmed row count, 0 if none
+    exchange.finish(shard)
+    exchange.done()
+```
+
+传入 `publisher` 时改用按页发布，而 `take()` 会抛 `RuntimeError`（不改状态）；
+未传发布器时保持逐行取数，此时调用 `flush()` 同样抛 `RuntimeError`。进入上下文时校验：
+`publisher` 为 `None` 或可调用对象，`page_rows` 为 1–128、`delivery_bytes` 为 0–1 MiB，
+二者均为整数且不接受布尔值；非发布模式也校验这两个新参数，但不使用发布额度。
+
+`publisher(page_id, rows)` 使用仅属于本次交换的命名空间，页号从 0 连续分配、`rows`
+为非空元组，元素与 `take()` 返回同形 `(shard, seq, Row)`。装载器保证整页写入或不写入，
+同一页号、完全相同的有序序列重复调用不增加副作用；正常返回表示已提交，抛出的异常不表明
+是否已提交，因此交换会保留该页并在下次 `flush()` 用相同页号、行身份、顺序与负载重试，
+即使其后又有更多行变得安全。每次 `flush()` 至多调用装载器一次；确认后返回本页行数。
+
+页的取法与 `take()` 一致：只取严格小于每个未结束分片下界的安全行（全部结束后取消限制），
+按 `(key, shard, seq)` 顺序，不足 `page_rows` 也照发；无安全行返回 0 且不占页号。分片保留
+与共享额度仍只约束待交付行；`delivery_bytes` 是独立的待确认页留存额度。发布前若整页代价
+可完整计入该留存额度且仍有余量，则把整页一次性转由它承担重试责任、立即归还原生产额度；
+否则整页继续占用原生产额度，绝不拆页分账，也绝不因额度不足而拒绝一个原本可交付的页。
+确认时只清本页实际仍占用的额度，不重复返还；有未确认页期间 `offer()` 仍按真实占用的
+生产额度准入。只有全部分片结束、无待发布行且无待确认页时 `done()` 才为真。
+
+
 
