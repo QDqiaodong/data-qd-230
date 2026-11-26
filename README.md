@@ -79,4 +79,34 @@ selected 值只要在任意放行时点胜出就保留；selected 删除只在�
 读取构建期峰值，而不是等文件删除后再测），临时逻辑字节数由后台线程在整个上下文期间
 持续采样目录得到，覆盖构建、归并和读游标各阶段。
 
+## 增量有序交换
+
+```py
+with ordered_exchange([reserve_0, reserve_1], shared_bytes=...,
+                      scratch=None) as exchange:
+    exchange.offer(shard, Row(key, payload))
+    exchange.advance(shard, lower_bound)
+    row = exchange.take()       # (shard, seq, Row) or None
+    exchange.finish(shard)
+    exchange.done()
+```
+
+`ordered_exchange` 是单进程、由调用方交错驱动的算子，不启动线程或后台任务。
+分片数为 `len(reserved_bytes)`（1 到 8），各分片保留额度之和加 `shared_bytes`
+至多 16 MiB；参数在进入上下文时读取。每行额度为 `32 + payload 的 UTF-8 字节数`：
+各分片先使用自己的保留额度，只有超出保留的部分合计占用共享额度，空闲保留额度不借给
+其他分片。额度不足时 `offer` 返回 `False`，且不推进序号或改变暂存状态；额度允许时
+返回 `True`。成功接收总数硬上限为 200,000，消费行不能恢复该上限。
+
+`advance(shard, lower_bound)` 承诺之后不会收到严格小于该下界的新键；下界只能持平或
+增大。`take()` 不等待分片：只有 `key` 严格小于每个未结束分片下界的行才可交付，全部分片
+结束后取消该限制。全局顺序为 `(key, shard, seq)`。交付立即释放该行额度，调用方继续持有
+返回的 `Row` 不占暂存额度。`finish` 可重复调用；结束分片不能再 `offer`/`advance`，但其
+限制随即失效。`done()` 仅在全部分片结束且没有待交付行时为真。
+
+实现把宽负载和 `(key, shard, seq)` 主键放入 scratch 下的私有 SQLite 文件（BLOB 原样保存
+UTF-8 字节），由主键完成排序，删除提交后以 `auto_vacuum=FULL` 回收文件空间；调用方逐行
+生成、不累积已消费负载时，Python 可跟踪分配峰值远低于 8 MiB，存活暂存字节也低于
+64 MiB。退出上下文会关闭连接并删除本次私有目录，不删除 scratch 中的调用方原有文件。
+
 

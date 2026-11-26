@@ -6,6 +6,7 @@ import heapq
 from itertools import islice
 import json
 from pathlib import Path
+import sqlite3
 from tempfile import TemporaryDirectory
 
 
@@ -942,3 +943,290 @@ def compact_versions(selected, untouched, *, snapshots=(), run_rows=128,
             yield batch
         finally:
             batch._shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Ordered exchange
+#
+# Unlike sorted_rows, this operator is driven incrementally by one caller.
+# Accepted rows live in a disk-backed ordered table; only one returned Row is
+# alive per take() call.  Per-shard reserves are bookkeeping values, while
+# SQLite supplies spilling, ordering and reuse of freed database pages.
+
+_EXCHANGE_ROW_LIMIT = 200_000
+_EXCHANGE_MAX_BUDGET = 16 * 1024 * 1024
+_EXCHANGE_MIN_KEY = -(1 << 63)
+_EXCHANGE_MAX_KEY_EXCLUSIVE = 1 << 63
+_EXCHANGE_COMMIT_ROWS = 128
+
+_EXCHANGE_SELECT_RESTRICTED = (
+    "SELECT shard, seq, key, payload FROM exchange_rows "
+    "WHERE key < ? ORDER BY key, shard, seq LIMIT 1"
+)
+_EXCHANGE_SELECT_ALL = (
+    "SELECT shard, seq, key, payload FROM exchange_rows "
+    "ORDER BY key, shard, seq LIMIT 1"
+)
+_EXCHANGE_INSERT = (
+    "INSERT INTO exchange_rows (key, shard, seq, payload) "
+    "VALUES (?, ?, ?, ?)"
+)
+_EXCHANGE_DELETE = (
+    "DELETE FROM exchange_rows WHERE key = ? AND shard = ? AND seq = ?"
+)
+
+
+class ordered_exchange:
+    """Incremental, disk-backed ordered exchange; use as a context manager."""
+
+    def __init__(self, reserved_bytes, *, shared_bytes, scratch=None):
+        # Values are snapshotted by __enter__, as required by the API.
+        self._reserved_arg = reserved_bytes
+        self._shared_arg = shared_bytes
+        self._scratch_arg = scratch
+        self._open = False
+        self._entered = False
+        self._root = None
+        self._tempdir = None
+        self._conn = None
+        self._cursor = None
+
+    def __enter__(self):
+        if self._entered:
+            raise RuntimeError("ordered_exchange context cannot be re-entered")
+        self._entered = True
+
+        reserved_arg = self._reserved_arg
+        if not isinstance(reserved_arg, (list, tuple)):
+            raise ValueError("reserved_bytes must be a list or tuple")
+        reserved = tuple(reserved_arg)
+        if not 1 <= len(reserved) <= 8:
+            raise ValueError("reserved_bytes must contain 1 to 8 shard budgets")
+        if any(type(value) is not int or value < 0 for value in reserved):
+            raise ValueError("reserved_bytes must contain non-negative integers")
+
+        shared = self._shared_arg
+        if type(shared) is not int or shared < 0:
+            raise ValueError("shared_bytes must be a non-negative integer")
+        if sum(reserved) + shared > _EXCHANGE_MAX_BUDGET:
+            raise ValueError("total exchange budget may not exceed 16 MiB")
+
+        self._shard_count = len(reserved)
+        self._reserved = reserved
+        self._shared_budget = shared
+        self._balances = [0] * self._shard_count
+        self._sequences = [0] * self._shard_count
+        self._lower_bounds = [_EXCHANGE_MIN_KEY] * self._shard_count
+        self._finished = [False] * self._shard_count
+        self._shared_used = 0
+        self._pending = 0
+        self._received = 0
+        self._mutations = 0
+        self._uncommitted_deletes = 0
+
+        self._tempdir = TemporaryDirectory(
+            dir=self._scratch_arg, prefix="ordered-exchange-")
+        self._root = Path(self._tempdir.name)
+        db_path = self._root / "exchange.sqlite3"
+        try:
+            self._conn = sqlite3.connect(str(db_path))
+            # No crash durability is needed.  Keep all auxiliary processing in
+            # memory and all persistent files in the private scratch directory.
+            self._conn.execute("PRAGMA auto_vacuum=FULL")
+            self._conn.execute("PRAGMA journal_mode=DELETE")
+            self._conn.execute("PRAGMA synchronous=OFF")
+            self._conn.execute("PRAGMA temp_store=MEMORY")
+            self._conn.execute("PRAGMA cache_size=-1024")
+            self._conn.execute(
+                "CREATE TABLE exchange_rows ("
+                "key INTEGER NOT NULL, "
+                "shard INTEGER NOT NULL, "
+                "seq INTEGER NOT NULL, "
+                "payload BLOB NOT NULL, "
+                "PRIMARY KEY (key, shard, seq)"
+                ") WITHOUT ROWID"
+            )
+            self._conn.commit()
+            self._cursor = self._conn.cursor()
+        except BaseException:
+            conn = self._conn
+            self._conn = None
+            try:
+                if conn is not None:
+                    conn.close()
+            finally:
+                tempdir = self._tempdir
+                self._tempdir = None
+                tempdir.cleanup()
+            raise
+
+        self._open = True
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.close()
+        return False
+
+    def close(self):
+        """Close SQLite handles and remove this exchange's private directory."""
+        self._open = False
+        conn = self._conn
+        tempdir = self._tempdir
+        self._conn = None
+        self._cursor = None
+        self._tempdir = None
+        try:
+            if conn is not None:
+                conn.close()
+        finally:
+            if tempdir is not None:
+                tempdir.cleanup()
+
+    def _require_open(self):
+        if not self._open:
+            raise RuntimeError("ordered_exchange context is closed")
+
+    def _shard_index(self, shard):
+        if type(shard) is not int or not 0 <= shard < self._shard_count:
+            raise ValueError(f"invalid shard: {shard!r}")
+        return shard
+
+    @staticmethod
+    def _valid_key(lower_bound):
+        if (type(lower_bound) is not int
+                or not _EXCHANGE_MIN_KEY <= lower_bound
+                < _EXCHANGE_MAX_KEY_EXCLUSIVE):
+            raise ValueError("lower_bound must be a signed 64-bit integer")
+        return lower_bound
+
+    def _commit(self):
+        self._conn.commit()
+        self._mutations = 0
+        self._uncommitted_deletes = 0
+
+    def _note_mutation(self, *, delete=False):
+        self._mutations += 1
+        if delete:
+            self._uncommitted_deletes += 1
+        if self._mutations >= _EXCHANGE_COMMIT_ROWS:
+            self._commit()
+
+    def _commit_drained_deletes(self):
+        # At a natural drain boundary, flush a meaningful residual batch so
+        # auto-vacuum can return its pages.  Tiny one-row interleavings still
+        # avoid an extra commit on every call.
+        if self._uncommitted_deletes >= 16:
+            self._commit()
+
+    def offer(self, shard, row):
+        """Admit one row if the per-shard/shared budget has room.
+
+        Returns True after the row has been handed to staging, or False when
+        the candidate would exceed shared capacity.  A False result changes
+        no sequence, budget or staged row.
+        """
+        self._require_open()
+        index = self._shard_index(shard)
+        if self._finished[index]:
+            raise ValueError(f"shard {index} is finished")
+        if self._received >= _EXCHANGE_ROW_LIMIT:
+            raise ValueError("ordered_exchange accepts at most 200000 rows")
+        if not isinstance(row, Row):
+            raise ValueError("row must be a Row")
+        if type(row.key) is not int or not (
+                _EXCHANGE_MIN_KEY <= row.key < _EXCHANGE_MAX_KEY_EXCLUSIVE):
+            raise ValueError("row key must be a signed 64-bit integer")
+        if row.key < self._lower_bounds[index]:
+            raise ValueError("row key is below the shard's lower bound")
+        if not isinstance(row.payload, str):
+            raise ValueError("row payload must be a string")
+        try:
+            payload = row.payload.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("row payload must be UTF-8 encodable") from None
+        if len(payload) > 4096:
+            raise ValueError("row payload exceeds 4096 UTF-8 bytes")
+
+        cost = 32 + len(payload)
+        old_balance = self._balances[index]
+        new_balance = old_balance + cost
+        reserve = self._reserved[index]
+        old_overflow = max(0, old_balance - reserve)
+        new_overflow = max(0, new_balance - reserve)
+        if (self._shared_used - old_overflow + new_overflow
+                > self._shared_budget):
+            return False
+
+        seq = self._sequences[index]
+        # Let SQLite/I/O failures propagate without having advanced any state.
+        self._cursor.execute(
+            _EXCHANGE_INSERT, (row.key, index, seq, payload))
+
+        self._balances[index] = new_balance
+        self._sequences[index] = seq + 1
+        self._shared_used += new_overflow - old_overflow
+        self._pending += 1
+        self._received += 1
+        self._note_mutation()
+        return True
+
+    def advance(self, shard, lower_bound):
+        """Promise that this shard will not later offer a smaller key."""
+        self._require_open()
+        index = self._shard_index(shard)
+        if self._finished[index]:
+            raise ValueError(f"shard {index} is finished")
+        bound = self._valid_key(lower_bound)
+        if bound < self._lower_bounds[index]:
+            raise ValueError("lower bounds cannot move backwards")
+        self._lower_bounds[index] = bound
+
+    def finish(self, shard):
+        """Mark a shard complete; repeated finish calls are allowed."""
+        self._require_open()
+        index = self._shard_index(shard)
+        self._finished[index] = True
+
+    def take(self):
+        """Return the next globally safe ``(shard, seq, Row)`` or None."""
+        self._require_open()
+
+        if all(self._finished):
+            self._cursor.execute(_EXCHANGE_SELECT_ALL)
+        else:
+            safety_bound = min(
+                bound for bound, finished in zip(
+                    self._lower_bounds, self._finished)
+                if not finished
+            )
+            self._cursor.execute(_EXCHANGE_SELECT_RESTRICTED, (safety_bound,))
+
+        record = self._cursor.fetchone()
+        if record is None:
+            self._commit_drained_deletes()
+            return None
+
+        index, seq, key, payload = record
+        self._cursor.execute(_EXCHANGE_DELETE, (key, index, seq))
+
+        cost = 32 + len(payload)
+        old_balance = self._balances[index]
+        reserve = self._reserved[index]
+        old_overflow = max(0, old_balance - reserve)
+        new_balance = old_balance - cost
+        new_overflow = max(0, new_balance - reserve)
+
+        self._balances[index] = new_balance
+        self._shared_used += new_overflow - old_overflow
+        self._pending -= 1
+        self._note_mutation(delete=True)
+
+        return index, seq, Row(key, payload.decode("utf-8"))
+
+    def done(self):
+        """True only when every shard is finished and no rows are pending."""
+        self._require_open()
+        complete = self._pending == 0 and all(self._finished)
+        if complete and self._uncommitted_deletes:
+            self._commit()
+        return complete
