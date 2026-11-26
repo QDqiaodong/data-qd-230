@@ -1,6 +1,7 @@
 """Disk-backed stable sort and budgeted full-join operators for keyed rows."""
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass
+import bisect
 import heapq
 from itertools import islice
 import json
@@ -343,3 +344,341 @@ def budgeted_full_join(left, right, *, pair_budget, run_rows=128, fan_in=8,
             joined.close()
             deferred_left.close()
             deferred_right.close()
+
+
+# ---------------------------------------------------------------------------
+# Partial-run version compaction
+#
+# Two one-shot version streams (the selected run set being replaced and the
+# untouched run sets) are each validated and externally sorted once.  A single
+# streaming merge then walks every key group in (key, revision) order and
+# decides, against at most 32 registered snapshot revisions plus the "latest"
+# read point, which selected originals still have to ship in the replacement
+# stream.  The batch cursors afterwards read only the spilled replacement
+# records and the untouched spill: the original selected input is never kept
+# around, neither in memory nor as a hidden file.
+
+_VERSION_ROW_LIMIT = 200_000
+_VERSION_MAX_PAYLOAD = 4096
+_VERSION_MAX_REVISION = (1 << 63) - 1
+_VERSION_MAX_SNAPSHOTS = 32
+_LATEST = 1 << 63  # sentinel revision standing for the unbounded latest read
+
+
+@dataclass(frozen=True)
+class Version:
+    key: int
+    revision: int
+    payload: object  # UTF-8-encodable str, or None for a delete marker
+
+
+def _check_version_params(snapshots, run_rows, fan_in, scratch):
+    if not isinstance(snapshots, (list, tuple)) or len(snapshots) > _VERSION_MAX_SNAPSHOTS:
+        raise ValueError("snapshots must be a list or tuple of at most 32 revisions")
+    seen = set()
+    for revision in snapshots:
+        if type(revision) is not int or not 0 <= revision <= _VERSION_MAX_REVISION:
+            raise ValueError("snapshot revisions must be ints in [0, 2**63 - 1]")
+        if revision in seen:
+            raise ValueError("snapshot revisions must be unique")
+        seen.add(revision)
+    if type(run_rows) is not int or not 1 <= run_rows <= 256:
+        raise ValueError("run_rows must be an int in [1, 256]")
+    if type(fan_in) is not int or not 2 <= fan_in <= 16:
+        raise ValueError("fan_in must be an int in [2, 16]")
+    if scratch is not None and not isinstance(scratch, (str, Path)):
+        raise ValueError("scratch must be None, a str or a Path")
+
+
+def _version_entries(rows, source):
+    """Validate one version stream; yield ``(key, revision, source, payload)``."""
+    for seq, row in enumerate(rows):
+        if seq >= _VERSION_ROW_LIMIT:
+            raise ValueError(f"row {seq}: exceeds the {_VERSION_ROW_LIMIT}-row limit")
+        if not isinstance(row, Version):
+            raise ValueError(f"row {seq}: expected Version")
+        if type(row.key) is not int or not -(1 << 63) <= row.key < (1 << 63):
+            raise ValueError(f"row {seq}: key must be a signed 64-bit int")
+        if type(row.revision) is not int or not 0 <= row.revision <= _VERSION_MAX_REVISION:
+            raise ValueError(f"row {seq}: revision must be an int in [0, 2**63 - 1]")
+        if row.payload is not None:
+            if not isinstance(row.payload, str):
+                raise ValueError(f"row {seq}: payload must be a str or None")
+            encoded = row.payload.encode("utf-8")
+            if len(encoded) > _VERSION_MAX_PAYLOAD:
+                raise ValueError(
+                    f"row {seq}: payload exceeds {_VERSION_MAX_PAYLOAD} UTF-8 bytes")
+        yield (row.key, row.revision, source, row.payload)
+
+
+def _version_merge(paths):
+    """Merge spills by (key, revision); payloads never participate in ordering."""
+    with ExitStack() as stack:
+        streams = [stack.enter_context(path.open(encoding="ascii")) for path in paths]
+        yield from heapq.merge(*(_read(stream) for stream in streams),
+                               key=lambda entry: (entry[0], entry[1]))
+
+
+def _spill_versions(rows, root, name, source, *, run_rows, fan_in):
+    """Sort one version stream into ``root/name.sorted.jsonl`` and return it."""
+
+    def part(level, index):
+        return root / f"{name}-{level}-{index}.jsonl"
+
+    entries = _version_entries(rows, source)
+    count = 0
+    while True:
+        chunk = list(islice(entries, run_rows))
+        if not chunk:
+            break
+        chunk.sort(key=lambda entry: (entry[0], entry[1]))
+        _write(part(0, count), chunk)
+        count += 1
+    level = 0
+    while count > fan_in:
+        written = 0
+        for start in range(0, count, fan_in):
+            group = [part(level, i) for i in range(start, min(start + fan_in, count))]
+            with closing(_version_merge(group)) as merged:
+                _write(part(level + 1, written), merged)
+            for old in group:
+                old.unlink()
+            written += 1
+        count, level = written, level + 1
+    final = root / f"{name}.sorted.jsonl"
+    if count == 0:
+        final.write_bytes(b"")
+    else:
+        with closing(_version_merge([part(level, i) for i in range(count)])) as merged:
+            _write(final, merged)
+        for i in range(count):
+            part(level, i).unlink()
+    return final
+
+
+def _version_from_entry(entry):
+    return Version(entry[0], entry[1], entry[3])
+
+
+class _KeyDecision:
+    """Streaming per-key sweep shared by all registered points and latest.
+
+    The key group is scanned once in ascending revision.  A monotonic cursor
+    over the registered points decides which points each record wins; the
+    delivered-view state (``last_kept``: the newest untouched row or kept
+    selected row, deletes included) is carried across points, so later points
+    reuse earlier decisions instead of rescanning history.
+
+    Inclusion rules:
+      * every untouched record belongs to the delivered view;
+      * a selected value is included when it wins a registered point or latest;
+      * a selected delete is included at the first point where the original
+        view is invisible but the delivered view would still show a value --
+        once a delete is the delivered winner it masks every older value, so a
+        later delete re-covering an invisible point is dropped.
+    """
+
+    __slots__ = ("points", "point_index", "last_kept", "shipped", "out")
+
+    def __init__(self, points, out):
+        self.points = points              # registered revisions, ascending
+        self.point_index = 0              # next registered point to resolve
+        self.last_kept = None             # current winner of the delivered view
+        self.shipped = None               # identity of the last shipped entry
+        self.out = out                    # callable shipping a kept selected row
+
+    def _ship(self, entry):
+        # A selected entry can be nominated by several points but must be
+        # delivered at most once.
+        if self.shipped is not entry:
+            self.shipped = entry
+            self.out(entry)
+
+    def _covered_points(self, entry, bound):
+        """Advance the point cursor across points ``entry`` wins; return count."""
+        points, index = self.points, self.point_index
+        covered = 0
+        while index < len(points) and points[index] <= bound:
+            if points[index] >= entry[1]:
+                covered += 1
+            index += 1
+        self.point_index = index
+        return covered
+
+    def add(self, entry, covered_through):
+        """Fold one record (ascending revision) into the sweep.
+
+        ``covered_through`` is the successor record's revision minus one.
+        """
+        covered = self._covered_points(entry, covered_through)
+        self._transition(entry, covered, latest=False)
+
+    def finish(self, entry):
+        """Resolve points still covered by the final record, then latest."""
+        covered = self._covered_points(entry, _VERSION_MAX_REVISION)
+        self._transition(entry, covered, latest=False)
+        # Latest is an additional release point resolved last, once per key.
+        self._transition(entry, 1, latest=True)
+
+    def _transition(self, entry, covered, latest):
+        source, payload = entry[2], entry[3]
+        if source == 1:
+            # All untouched rows stay in place, so the delivered view always
+            # advances to an untouched record even if it wins no registered
+            # point in the original view.
+            self.last_kept = entry
+            return
+        if payload is not None:
+            # Rule 1: a selected value winning any release point (latest
+            # included) ships and enters the delivered view.
+            if covered:
+                self._ship(entry)
+                self.last_kept = entry
+            return
+        # Selected delete: rule 2.  Keep it at the first point where the
+        # original view is invisible but the delivered view would show a
+        # value.  A delete already in the delivered winner keeps masking all
+        # older values, so another covering delete is never shipped.
+        if covered and self.last_kept is not None and self.last_kept[3] is not None:
+            self._ship(entry)
+            self.last_kept = entry
+
+
+def _write_replacement(merged_path, replacement_path, points):
+    """One streaming pass over the (key, revision)-sorted two-side merge."""
+    with open(merged_path, "rb") as stream, \
+            replacement_path.open("w", encoding="ascii", newline="\n") as out:
+        def ship(entry):
+            out.write(json.dumps(list(entry), ensure_ascii=True,
+                                 separators=(",", ":")) + "\n")
+
+        decision = None
+        current_key = None
+        previous = None
+        for line in stream:
+            entry = tuple(json.loads(line))
+            key = entry[0]
+            if key != current_key:
+                if decision is not None:
+                    decision.finish(previous)
+                current_key = key
+                decision = _KeyDecision(points, ship)
+                previous = entry
+                continue
+            if entry[1] == previous[1]:
+                raise ValueError(
+                    f"duplicate revision {entry[1]} for key {key} across inputs")
+            decision.add(previous, entry[1] - 1)
+            previous = entry
+        if decision is not None:
+            decision.finish(previous)
+
+
+class _VersionBatch:
+    """Re-openable replacement and point-query cursors over spilled results."""
+
+    def __init__(self, replacement_path, untouched_path, points, root):
+        self._replacement = replacement_path
+        self._untouched = untouched_path
+        self._points = points
+        self._root = root
+        self._closed = False
+        self._active = set()
+
+    def _track(self, generator):
+        def wrap():
+            try:
+                yield from generator
+            finally:
+                self._active.discard(wrapped)
+
+        wrapped = wrap()
+        self._active.add(wrapped)
+        return wrapped
+
+    def replacement(self):
+        if self._closed:
+            raise RuntimeError("version batch has been closed")
+        return self._track(self._replacement_cursor())
+
+    def visible(self, at=None):
+        if self._closed:
+            raise RuntimeError("version batch has been closed")
+        if at is not None:
+            if type(at) is not int or not 0 <= at <= _VERSION_MAX_REVISION:
+                raise ValueError("at must be None or a registered revision")
+            index = bisect.bisect_left(self._points, at)
+            if index == len(self._points) or self._points[index] != at:
+                raise ValueError(f"{at} is not a registered snapshot revision")
+        return self._track(self._visible_cursor(at))
+
+    def _replacement_cursor(self):
+        with open(self._replacement, "rb") as stream:
+            for line in stream:
+                yield _version_from_entry(tuple(json.loads(line)))
+
+    def _visible_cursor(self, at):
+        bound = _LATEST if at is None else at
+        with open(self._untouched, "rb") as untouched_stream, \
+                open(self._replacement, "rb") as replacement_stream:
+            sources = (
+                (tuple(json.loads(line)) for line in untouched_stream),
+                (tuple(json.loads(line)) for line in replacement_stream),
+            )
+            current_key = None
+            winner = None
+            for entry in heapq.merge(*sources, key=lambda item: (item[0], item[1])):
+                key = entry[0]
+                if key != current_key:
+                    if winner is not None and winner[3] is not None:
+                        yield _version_from_entry(winner)
+                    current_key = key
+                    # Each key starts with no in-bound winner: a key whose
+                    # records all exceed the read bound stays invisible and
+                    # must not inherit the previous key's winner.
+                    winner = None
+                # Only in-bound records compete for the visible row; the last
+                # such record wins, including when it is a delete.
+                if entry[1] <= bound:
+                    winner = entry
+            if winner is not None and winner[3] is not None:
+                yield _version_from_entry(winner)
+
+    def _shutdown(self):
+        self._closed = True
+        # Any cursor still suspended inside the with-block is closed by the
+        # generator close() below; its finally-block drops the registration.
+        for token in list(self._active):
+            token.close()
+
+
+@contextmanager
+def compact_versions(selected, untouched, *, snapshots=(), run_rows=128,
+                     fan_in=8, scratch=None):
+    """Compact one replaceable run set while other run sets stay untouched.
+
+    Yields a batch whose replacement cursor ships only the selected originals
+    still needed to reproduce the registered historical read points and the
+    latest view; point queries read the replacement spill together with the
+    untouched spill, never the original selected input.
+    """
+    _check_version_params(snapshots, run_rows, fan_in, scratch)
+    points = sorted(snapshots)
+    with TemporaryDirectory(dir=scratch, prefix="version-compact-") as base:
+        root = Path(base)
+        selected_path = _spill_versions(
+            selected, root, "selected", 0, run_rows=run_rows, fan_in=fan_in)
+        untouched_path = _spill_versions(
+            untouched, root, "untouched", 1, run_rows=run_rows, fan_in=fan_in)
+        merged_path = root / "merged.jsonl"
+        with closing(_version_merge([untouched_path, selected_path])) as merged:
+            _write(merged_path, merged)
+        replacement_path = root / "replacement.sorted.jsonl"
+        _write_replacement(merged_path, replacement_path, points)
+        merged_path.unlink()
+        selected_path.unlink()
+        batch = _VersionBatch(replacement_path, untouched_path, points, root)
+        try:
+            yield batch
+        finally:
+            batch._shutdown()
