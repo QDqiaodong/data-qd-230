@@ -652,6 +652,266 @@ class _VersionBatch:
             token.close()
 
 
+# ---------------------------------------------------------------------------
+# Late-materialized grouped Top-K
+#
+# The query node receives a one-shot stream of narrow index hits while the
+# wide payloads live on backend data pages.  Materialising every hit before
+# ranking would read pages for candidates that later lose, and fetching row
+# by row in rank order would re-read pages whose hits interleave.  This
+# operator therefore ranks first and reads late: the index stream is
+# validated and externally sorted once when the context is entered, the best
+# hit per group is elected (highest score, ties by arrival order) and the
+# first ``limit`` distinct groups are kept.  While the caller consumes that
+# ranking, each backing page is read exactly once -- at the first rank that
+# needs it, asking for precisely the slots the selected hits use on the
+# page, including slots only needed by later ranks.  Payloads whose delivery
+# ranks lie ahead are staged in this call's temp directory, so arbitrarily
+# interleaved pages never force pending wide rows into memory.
+
+_RANK_ROW_LIMIT = 200_000
+_RANK_MAX_PAYLOAD = 4096
+
+
+@dataclass(frozen=True)
+class Hit:
+    group: int
+    score: int
+    page: int
+    slot: int
+
+
+def _check_rank_params(limit, run_rows, fan_in, scratch):
+    if type(limit) is not int or not 0 <= limit <= _RANK_ROW_LIMIT:
+        raise ValueError("limit must be an int in [0, 200000]")
+    if type(run_rows) is not int or not 1 <= run_rows <= 256:
+        raise ValueError("run_rows must be an int in [1, 256]")
+    if type(fan_in) is not int or not 2 <= fan_in <= 16:
+        raise ValueError("fan_in must be an int in [2, 16]")
+    if scratch is not None and not isinstance(scratch, (str, Path)):
+        raise ValueError("scratch must be None, a str or a Path")
+
+
+def _hit_entries(hits):
+    """Validate the one-shot hit stream; yield ``[group, -score, seq, page, slot]``."""
+    for seq, hit in enumerate(hits):
+        if seq >= _RANK_ROW_LIMIT:
+            raise ValueError(f"row {seq}: exceeds the {_RANK_ROW_LIMIT}-row limit")
+        if not isinstance(hit, Hit):
+            raise ValueError(f"row {seq}: expected Hit")
+        if type(hit.group) is not int or not -(1 << 63) <= hit.group < (1 << 63):
+            raise ValueError(f"row {seq}: group must be a signed 64-bit int")
+        if type(hit.score) is not int or not -(1 << 63) <= hit.score < (1 << 63):
+            raise ValueError(f"row {seq}: score must be a signed 64-bit int")
+        if type(hit.page) is not int or not 0 <= hit.page < (1 << 63):
+            raise ValueError(f"row {seq}: page must be an int in [0, 2**63 - 1]")
+        if type(hit.slot) is not int or not 0 <= hit.slot <= 127:
+            raise ValueError(f"row {seq}: slot must be an int in [0, 127]")
+        yield [hit.group, -hit.score, seq, hit.page, hit.slot]
+
+
+def _spill_records(entries, root, name, *, run_rows, fan_in):
+    """Externally sort JSON int records into ``root/name.sorted.jsonl``."""
+    def part(level, index):
+        return root / f"{name}-{level}-{index}.jsonl"
+
+    iterator = iter(entries)
+    count = 0
+    while True:
+        chunk = list(islice(iterator, run_rows))
+        if not chunk:
+            break
+        chunk.sort()
+        _write(part(0, count), chunk)
+        count += 1
+    level = 0
+    while count > fan_in:
+        written = 0
+        for start in range(0, count, fan_in):
+            group = [part(level, i) for i in range(start, min(start + fan_in, count))]
+            with closing(_merge(group)) as merged:
+                _write(part(level + 1, written), merged)
+            for old in group:
+                old.unlink()
+            written += 1
+        count, level = written, level + 1
+    final = root / f"{name}.sorted.jsonl"
+    if count == 0:
+        final.write_bytes(b"")
+    else:
+        with closing(_merge([part(level, i) for i in range(count)])) as merged:
+            _write(final, merged)
+        for i in range(count):
+            part(level, i).unlink()
+    return final
+
+
+def _winner_entries(hits_path):
+    """Fold the (group, -score, seq)-sorted hits into one winner per group."""
+    previous = None
+    with open(hits_path, encoding="ascii") as stream:
+        for line in stream:
+            group, neg_score, seq, page, slot = json.loads(line)
+            if group != previous:
+                previous = group
+                yield [neg_score, seq, group, page, slot]
+
+
+def _write_selected(winners_path, selected_path, limit):
+    """Keep the first ``limit`` rank-ordered winners in ``selected_path``.
+
+    Yields one ``[page, rank, slot]`` record per selected hit for the page
+    index.
+    """
+    rank = 0
+    with open(winners_path, encoding="ascii") as stream, \
+            selected_path.open("w", encoding="ascii", newline="\n") as out:
+        for line in stream:
+            if rank >= limit:
+                break
+            neg_score, _seq, group, page, slot = json.loads(line)
+            out.write(json.dumps([page, slot, group, -neg_score],
+                                 separators=(",", ":")) + "\n")
+            yield [page, rank, slot]
+            rank += 1
+
+
+def _plan_entries(bypage_path):
+    """Aggregate the (page, rank, slot) stream into page-read plan records.
+
+    Emits one ``[first_rank, 0, page, slots]`` record per page (the read
+    request) and one ``[first_rank, 1, slot, rank]`` record per selected hit
+    (the delivery assignments); the plan spill orders them by first use.
+    """
+    with open(bypage_path, encoding="ascii") as stream:
+        page = None
+        first_rank = 0
+        slots = set()
+        for line in stream:
+            found_page, rank, slot = json.loads(line)
+            if found_page != page:
+                if page is not None:
+                    yield [first_rank, 0, page, sorted(slots)]
+                page, first_rank, slots = found_page, rank, set()
+            slots.add(slot)
+            yield [first_rank, 1, slot, rank]
+        if page is not None:
+            yield [first_rank, 0, page, sorted(slots)]
+
+
+def _check_page_response(page, slots, response):
+    if not isinstance(response, dict) or len(response) != len(slots):
+        raise ValueError(
+            f"page {page}: response must be a dict keyed by exactly "
+            "the requested slots")
+    wanted = set(slots)
+    for key, value in response.items():
+        if type(key) is not int or key not in wanted:
+            raise ValueError(f"page {page}: unexpected slot {key!r} in response")
+        if not isinstance(value, str):
+            raise ValueError(f"page {page}: slot {key}: payload must be a str")
+        try:
+            encoded = value.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError(
+                f"page {page}: slot {key}: payload is not UTF-8 encodable") from None
+        if len(encoded) > _RANK_MAX_PAYLOAD:
+            raise ValueError(
+                f"page {page}: slot {key}: payload exceeds "
+                f"{_RANK_MAX_PAYLOAD} UTF-8 bytes")
+
+
+def _ranked_rows(selected_path, plan_path, payloads_path, offsets_path, read_page):
+    opened = []
+    try:
+        selected = open(selected_path, encoding="ascii")
+        opened.append(selected)
+        plan = open(plan_path, encoding="ascii")
+        opened.append(plan)
+        payloads = open(payloads_path, "w+b")
+        opened.append(payloads)
+        offsets = open(offsets_path, "w+b")
+        opened.append(offsets)
+        pending = plan.readline()
+        for rank, line in enumerate(selected):
+            page, slot, group, score = json.loads(line)
+            if pending:
+                record = json.loads(pending)
+                if record[0] == rank:
+                    # First use of this page: read it once, asking for every
+                    # slot any selected hit will need, and validate the whole
+                    # response before anything from it is staged or delivered.
+                    slots = record[3]
+                    response = read_page(record[2], tuple(slots))
+                    _check_page_response(record[2], slots, response)
+                    written = {}
+                    while True:
+                        pending = plan.readline()
+                        if not pending:
+                            break
+                        record = json.loads(pending)
+                        if record[0] != rank:
+                            break
+                        found_slot, found_rank = record[2], record[3]
+                        location = written.get(found_slot)
+                        if location is None:
+                            data = response[found_slot].encode("utf-8")
+                            payloads.seek(0, 2)
+                            location = (payloads.tell(), len(data))
+                            payloads.write(data)
+                            written[found_slot] = location
+                        offsets.seek(found_rank * 16)
+                        offsets.write(location[0].to_bytes(8, "little"))
+                        offsets.write(location[1].to_bytes(8, "little"))
+                    del response, written
+            offsets.seek(rank * 16)
+            position = offsets.read(16)
+            payloads.seek(int.from_bytes(position[:8], "little"))
+            payload = payloads.read(int.from_bytes(position[8:], "little")).decode("utf-8")
+            yield (Hit(group, score, page, slot), payload)
+    finally:
+        for stream in opened:
+            stream.close()
+
+
+@contextmanager
+def late_ranked_rows(hits, read_page, *, limit, run_rows=128, fan_in=8,
+                     scratch=None):
+    """Yield a one-shot iterator of ``(hit, payload)`` for the grouped Top-K.
+
+    The one-shot ``hits`` stream is consumed and validated when the context
+    is entered; no page is read before the caller starts consuming.  Hits
+    rank by descending score, ties by original arrival order; the best hit
+    per group is elected and the first ``limit`` distinct groups are
+    delivered in that order.  ``read_page(page, slots)`` is called at most
+    once per page, only when the rank about to be delivered first needs it,
+    with exactly the slots the selected hits use on that page.  The iterator
+    is valid only within the with-block.
+    """
+    _check_rank_params(limit, run_rows, fan_in, scratch)
+    with TemporaryDirectory(dir=scratch, prefix="row-rank-") as base:
+        root = Path(base)
+        hits_path = _spill_records(_hit_entries(hits), root, "hits",
+                                   run_rows=run_rows, fan_in=fan_in)
+        winners_path = _spill_records(_winner_entries(hits_path), root, "winners",
+                                      run_rows=run_rows, fan_in=fan_in)
+        hits_path.unlink()
+        selected_path = root / "selected.jsonl"
+        bypage_path = _spill_records(
+            _write_selected(winners_path, selected_path, limit),
+            root, "bypage", run_rows=run_rows, fan_in=fan_in)
+        winners_path.unlink()
+        plan_path = _spill_records(_plan_entries(bypage_path), root, "plan",
+                                   run_rows=run_rows, fan_in=fan_in)
+        bypage_path.unlink()
+        cursor = _ranked_rows(selected_path, plan_path, root / "payloads.bin",
+                              root / "offsets.bin", read_page)
+        try:
+            yield cursor
+        finally:
+            cursor.close()
+
+
 @contextmanager
 def compact_versions(selected, untouched, *, snapshots=(), run_rows=128,
                      fan_in=8, scratch=None):
