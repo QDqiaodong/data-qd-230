@@ -6,6 +6,7 @@ import heapq
 from itertools import islice
 import json
 from pathlib import Path
+import shutil
 import sqlite3
 from tempfile import TemporaryDirectory
 
@@ -1382,3 +1383,535 @@ class ordered_exchange:
         if complete and self._uncommitted_deletes:
             self._commit()
         return complete
+
+
+# ---------------------------------------------------------------------------
+# Partitioned look-ahead window
+#
+# The one-shot input is validated and sorted once into one spill per shard;
+# each shard owns an exclusive scratch directory so it can be removed on its
+# own while other shards keep streaming.  Payloads never leave their shard.
+# A small SQLite database at the batch root holds only integer per-key counts
+# (global counts, per-shard attribution and the retired ranges' retained
+# counts); it cannot substitute for any shard because it carries no payloads
+# and no arrival order.  Each shard cursor keeps a monotonic sliding window
+# over the distinct-key count table, so the delivered counts never depend on
+# which other shards have been read or retired.
+
+_WINDOW_ROW_LIMIT = 200_000
+_WINDOW_MAX_PAYLOAD = 4096
+_WINDOW_MAX_CUTS = 7
+_WINDOW_SQL_MIN = -(1 << 63)
+_WINDOW_SQL_MAX = (1 << 63) - 1
+_WINDOW_PAGE = 256
+
+
+def _check_window_params(cuts, preceding, carry_keys, run_rows, fan_in, scratch):
+    if not isinstance(cuts, (list, tuple)):
+        raise ValueError("cuts must be a list or tuple of keys")
+    if len(cuts) > _WINDOW_MAX_CUTS:
+        raise ValueError("cuts may contain at most 7 entries")
+    previous = None
+    for cut in cuts:
+        if type(cut) is not int or not _WINDOW_SQL_MIN <= cut <= _WINDOW_SQL_MAX:
+            raise ValueError("cuts must contain signed 64-bit integer keys")
+        if previous is not None and cut <= previous:
+            raise ValueError("cuts must be strictly increasing")
+        previous = cut
+    if type(preceding) is not int or not 0 <= preceding <= _WINDOW_SQL_MAX:
+        raise ValueError("preceding must be an int in [0, 2**63 - 1]")
+    if type(carry_keys) is not int or not 0 <= carry_keys <= _WINDOW_ROW_LIMIT:
+        raise ValueError("carry_keys must be an int in [0, 200000]")
+    if type(run_rows) is not int or not 1 <= run_rows <= 256:
+        raise ValueError("run_rows must be an int in [1, 256]")
+    if type(fan_in) is not int or not 2 <= fan_in <= 16:
+        raise ValueError("fan_in must be an int in [2, 16]")
+    if scratch is not None and not isinstance(scratch, (str, Path)):
+        raise ValueError("scratch must be None, a str or a Path")
+
+
+def _window_entries(rows, boundaries):
+    """Validate the one-shot stream; yield ``(shard, key, seq, payload)``."""
+    seq = 0
+    for row in rows:
+        if seq >= _WINDOW_ROW_LIMIT:
+            raise ValueError(f"row {seq}: exceeds the {_WINDOW_ROW_LIMIT}-row limit")
+        if (not isinstance(row, Row) or type(row.key) is not int
+                or not _WINDOW_SQL_MIN <= row.key <= _WINDOW_SQL_MAX
+                or not isinstance(row.payload, str)):
+            raise ValueError(f"row {seq}: expected signed 64-bit key and string payload")
+        if (len(row.payload) > _WINDOW_MAX_PAYLOAD
+                or len(row.payload.encode("utf-8")) > _WINDOW_MAX_PAYLOAD):
+            raise ValueError(f"row {seq}: payload exceeds {_WINDOW_MAX_PAYLOAD} UTF-8 bytes")
+        shard = bisect.bisect_right(boundaries, row.key)
+        yield shard, row.key, seq, row.payload
+        seq += 1
+
+
+def _spill_partitioned(rows, boundaries, shard_count, root, *, run_rows, fan_in):
+    """Sort the one-shot input into ``shard-N/rows.sorted.jsonl`` per shard."""
+    run_counts = [0] * shard_count
+    chunk = []
+
+    def run_path(shard, index):
+        directory = root / f"shard-{shard}"
+        directory.mkdir(exist_ok=True)
+        return directory / f"run-{index}.jsonl"
+
+    def flush(chunk):
+        # Global input sequence makes every entry orderable so heapq.merge
+        # stays stable for equal keys across run files and merge levels.
+        chunk.sort(key=lambda entry: (entry[1], entry[2]))
+        grouped = [[] for _ in range(shard_count)]
+        for entry in chunk:
+            grouped[entry[0]].append(entry)
+        for owner, entries in enumerate(grouped):
+            if not entries:
+                continue
+            index = run_counts[owner]
+            run_counts[owner] = index + 1
+            with run_path(owner, index).open(
+                    "w", encoding="ascii", newline="\n") as out:
+                for entry in entries:
+                    out.write(json.dumps(entry[1:], separators=(",", ":")) + "\n")
+
+    for shard, key, seq, payload in _window_entries(rows, boundaries):
+        chunk.append([shard, key, seq, payload])
+        if len(chunk) == run_rows:
+            flush(chunk)
+            chunk = []
+    if chunk:
+        flush(chunk)
+
+    final_paths = []
+    for shard in range(shard_count):
+        directory = root / f"shard-{shard}"
+        count = run_counts[shard]
+        if count == 0:
+            directory.mkdir(exist_ok=True)
+            final = directory / "rows.sorted.jsonl"
+            final.write_bytes(b"")
+            final_paths.append(final)
+            continue
+
+        def part(level, index, shard=shard):
+            return root / f"shard-{shard}" / f"l{level}-{index}.jsonl"
+
+        level = 0
+        while count > fan_in:
+            written = 0
+            for start in range(0, count, fan_in):
+                group = [run_path(shard, i) if level == 0 else part(level - 1, i)
+                         for i in range(start, min(start + fan_in, count))]
+                with closing(_merge(group)) as merged:
+                    _write(part(level, written), merged)
+                for old in group:
+                    old.unlink()
+                written += 1
+            count, level = written, level + 1
+        group = [run_path(shard, i) if level == 0 else part(level - 1, i)
+                 for i in range(count)]
+        final = directory / "rows.sorted.jsonl"
+        if count == 1:
+            group[0].rename(final)
+        else:
+            with closing(_merge(group)) as merged:
+                _write(final, merged)
+            for old in group:
+                old.unlink()
+        final_paths.append(final)
+    return final_paths
+
+
+def _sql_bound(value):
+    """Clamp a mathematical window bound to SQLite's signed 64-bit range."""
+    if value < _WINDOW_SQL_MIN:
+        return _WINDOW_SQL_MIN
+    if value > _WINDOW_SQL_MAX:
+        return _WINDOW_SQL_MAX
+    return value
+
+
+class _CountCursor:
+    """Monotonic position cursor over the distinct-key count table.
+
+    The immutable table is addressed by absolute row index.  The cursor
+    buffers one page covering ``[_page_start, _page_start + len(page))`` and
+    keeps ``_pos`` at the first row not yet folded into the sum: rows failing
+    the edge predicate leave ``_pos`` untouched so a later, larger edge folds
+    them, while rows that pass advance it.  When ``_pos`` leaves the buffered
+    page, the next page is fetched with a keyset predicate against the last
+    buffered key -- never re-reading rows, at most one page buffered.
+    """
+
+    __slots__ = ("_conn", "_page", "_page_start", "_pos", "_row_count")
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._page = []
+        self._page_start = 0
+        self._pos = 0
+        self._row_count = conn.execute(
+            "SELECT COUNT(*) FROM window_counts").fetchone()[0]
+
+    def _ensure(self):
+        if self._pos >= self._row_count:
+            return None
+        offset = self._pos - self._page_start
+        if offset < len(self._page):
+            return self._page[offset]
+        if not self._page:
+            self._page = self._conn.execute(
+                "SELECT key, total FROM window_counts ORDER BY key LIMIT ?",
+                (_WINDOW_PAGE,)).fetchall()
+        else:
+            self._page = self._conn.execute(
+                "SELECT key, total FROM window_counts WHERE key > ? "
+                "ORDER BY key LIMIT ?",
+                (self._page[-1][0], _WINDOW_PAGE)).fetchall()
+        self._page_start = self._pos
+        return self._page[0] if self._page else None
+
+    def advance_while(self, predicate):
+        """Fold every row satisfying ``predicate`` into the returned sum.
+
+        Rows failing the predicate keep the cursor positioned on them so the
+        next monotonic edge can fold them; passing rows advance the position.
+        Because predicates are monotonic, once a row fails every earlier row
+        also fails and the scan can stop until the edge moves.
+        """
+        total = 0
+        while True:
+            row = self._ensure()
+            if row is None or not predicate(row[0]):
+                return total
+            self._pos += 1
+            total += row[1]
+
+
+class _WindowSum:
+    """Monotonic sliding sum over distinct-key integer counts.
+
+    Two independent paginated cursors mark the inclusive upper edge (keys
+    ``<= t``) and the lower edge (keys ``< t - preceding``); both move forward
+    only, so per-shard work is linear in the number of distinct keys while the
+    buffered state stays at most two pages.
+    """
+
+    __slots__ = ("_high", "_low", "_total", "_preceding")
+
+    def __init__(self, conn, preceding):
+        self._high = _CountCursor(conn)
+        self._low = _CountCursor(conn)
+        self._total = 0
+        self._preceding = preceding
+
+    def value_at(self, t):
+        """Return the sum of counts of distinct keys in ``[t-preceding, t]``."""
+        bound = t - self._preceding
+        self._total += self._high.advance_while(lambda key: key <= t)
+        self._total -= self._low.advance_while(lambda key: key < bound)
+        return self._total
+
+
+class _ShardCursor:
+    """One-line-ahead reader plus that shard's sliding window state."""
+
+    __slots__ = ("_reader", "window", "exhausted")
+
+    def __init__(self, path, conn, preceding):
+        self._reader = _LineReader(path)
+        self.window = _WindowSum(conn, preceding)
+        self.exhausted = False
+
+    def close(self):
+        self._reader.close()
+
+    def peek_line(self):
+        line = self._reader.peek()
+        if line is None:
+            self.exhausted = True
+        return line
+
+    def pop_line(self):
+        return self._reader.pop()
+
+
+class _PartitionedBatch:
+    """Batch object handed out by :func:`partitioned_window`."""
+
+    def __init__(self, tempdir, root, conn, spill_paths, preceding, carry_keys):
+        self._tempdir = tempdir
+        self._root = root
+        self._conn = conn
+        self._spill_paths = list(spill_paths)
+        self._preceding = preceding
+        self._carry_keys = carry_keys
+        self._shard_count = len(spill_paths)
+        self._cursors = [None] * self._shard_count
+        self._retired = [False] * self._shard_count
+        self._open = True
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _require_open(self):
+        if not self._open:
+            raise RuntimeError("partitioned window batch has been closed")
+
+    def _check_shard(self, shard):
+        if type(shard) is not int or not 0 <= shard < self._shard_count:
+            raise ValueError(f"invalid shard: {shard!r}")
+        return shard
+
+    def close(self):
+        if not self._open:
+            return
+        self._open = False
+        for cursor in self._cursors:
+            if cursor is not None:
+                cursor.close()
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            conn.close()
+        tempdir = self._tempdir
+        self._tempdir = None
+        if tempdir is not None:
+            tempdir.cleanup()
+
+    # -- public API --------------------------------------------------------
+
+    def owner_path(self, shard):
+        self._require_open()
+        shard = self._check_shard(shard)
+        return self._spill_paths[shard].parent
+
+    def take(self, shard):
+        self._require_open()
+        shard = self._check_shard(shard)
+        if self._retired[shard]:
+            raise RuntimeError(f"shard {shard} has been retired")
+        cursor = self._cursors[shard]
+        if cursor is None:
+            cursor = _ShardCursor(
+                self._spill_paths[shard], self._conn, self._preceding)
+            self._cursors[shard] = cursor
+
+        line = cursor.peek_line()
+        if line is None:
+            return None
+        key = _line_key(line)
+        cursor.pop_line()
+        count = cursor.window.value_at(key)
+        entry = json.loads(line)
+        if cursor.peek_line() is None:
+            cursor.exhausted = True
+        return Row(entry[0], entry[2]), count
+
+    def retire(self, shard):
+        self._require_open()
+        shard = self._check_shard(shard)
+        if self._retired[shard]:
+            return True
+        cursor = self._cursors[shard]
+        if cursor is not None:
+            # Refresh the exhausted flag for a cursor created but never read.
+            cursor.peek_line()
+            if not cursor.exhausted:
+                return False
+        else:
+            # Never opened: make sure the shard really has no rows.
+            with self._spill_paths[shard].open("rb") as stream:
+                if stream.readline():
+                    return False
+
+        # Keys live in exactly one shard and shards are key-ordered, so only
+        # un-taken rows of strictly right-hand shards can cover a key of this
+        # shard.  The smallest un-taken key to the right decides everything:
+        # a key c is still needed iff c + preceding >= that key.  Unopened
+        # shards count via their first key; empty and retired shards have no
+        # un-taken rows and contribute nothing.
+        right_min = None
+        for other in range(shard + 1, self._shard_count):
+            if self._retired[other]:
+                continue
+            other_cursor = self._cursors[other]
+            if other_cursor is not None:
+                line = other_cursor.peek_line()
+                if line is None:
+                    continue
+                candidate = _line_key(line)
+            else:
+                row = self._conn.execute(
+                    "SELECT MIN(key) FROM shard_counts WHERE shard = ?",
+                    (other,)).fetchone()
+                if row[0] is None:
+                    continue
+                candidate = row[0]
+            if right_min is None or candidate < right_min:
+                right_min = candidate
+
+        # Drop retained counts no un-taken row can still reach before billing;
+        # unopened shards count through their first key, so nothing is released
+        # merely because a range has not been consumed yet.
+        self._release_stale_reserve()
+        if right_min is None:
+            needed = already = 0
+            threshold = None
+        else:
+            threshold = _sql_bound(right_min - self._preceding)
+            needed = self._conn.execute(
+                "SELECT COUNT(*) FROM shard_counts "
+                "WHERE shard = ? AND key >= ?", (shard, threshold)).fetchone()[0]
+            # Slots already retained for earlier retirements are shared: never
+            # bill the same distinct key twice, even across source shards.
+            already = self._conn.execute(
+                "SELECT COUNT(*) FROM reserve_counts r "
+                "JOIN shard_counts c ON c.key = r.key "
+                "WHERE c.shard = ? AND c.key >= ?",
+                (shard, threshold)).fetchone()[0]
+        held = self._conn.execute(
+            "SELECT COUNT(*) FROM reserve_counts").fetchone()[0]
+        if held + (needed - already) > self._carry_keys:
+            # The source stays fully usable; no state moved on failure.
+            return False
+
+        if threshold is not None:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO reserve_counts(key, total) "
+                "SELECT c.key, w.total FROM shard_counts c "
+                "JOIN window_counts w ON w.key = c.key "
+                "WHERE c.shard = ? AND c.key >= ?",
+                (shard, threshold))
+        self._conn.execute("DELETE FROM shard_counts WHERE shard = ?", (shard,))
+        self._conn.commit()
+
+        if cursor is not None:
+            cursor.close()
+            self._cursors[shard] = None
+        shutil.rmtree(self._spill_paths[shard].parent)
+        self._retired[shard] = True
+        return True
+
+    # -- internals ---------------------------------------------------------
+
+    def _global_min_untaken(self):
+        """Smallest key any non-retired shard still has to deliver."""
+        lowest = None
+        for shard in range(self._shard_count):
+            if self._retired[shard]:
+                continue
+            cursor = self._cursors[shard]
+            if cursor is not None:
+                line = cursor.peek_line()
+                if line is None:
+                    continue
+                candidate = _line_key(line)
+            else:
+                row = self._conn.execute(
+                    "SELECT MIN(key) FROM shard_counts WHERE shard = ?",
+                    (shard,)).fetchone()
+                if row[0] is None:
+                    continue
+                candidate = row[0]
+            if lowest is None or candidate < lowest:
+                lowest = candidate
+        return lowest
+
+    def _release_stale_reserve(self):
+        """Free retained keys beyond every remaining row's look-ahead reach."""
+        lowest = self._global_min_untaken()
+        if lowest is None:
+            self._conn.execute("DELETE FROM reserve_counts")
+            self._conn.commit()
+            return
+        bound = _sql_bound(lowest - self._preceding)
+        self._conn.execute("DELETE FROM reserve_counts WHERE key < ?", (bound,))
+        self._conn.commit()
+
+
+@contextmanager
+def partitioned_window(rows, cuts, *, preceding, carry_keys,
+                       run_rows=128, fan_in=8, scratch=None):
+    """Yield a batch delivering sorted rows with look-ahead window counts.
+
+    Rows equal to a cut belong to the right-hand shard.  Each shard keeps its
+    original rows in an exclusive scratch directory and can be retired
+    independently; retiring a fully consumed shard keeps only per-distinct-key
+    integer counts (billed against ``carry_keys``) for the windows still
+    owed to other shards.  Counts are computed from the whole original batch
+    and never change because of the read or retire schedule.
+    """
+    _check_window_params(cuts, preceding, carry_keys, run_rows, fan_in, scratch)
+    boundaries = tuple(cuts)
+    shard_count = len(boundaries) + 1
+
+    tempdir = TemporaryDirectory(dir=scratch, prefix="partitioned-window-")
+    root = Path(tempdir.name)
+    conn = None
+    batch = None
+    try:
+        spill_paths = _spill_partitioned(
+            rows, boundaries, shard_count, root,
+            run_rows=run_rows, fan_in=fan_in)
+
+        conn = sqlite3.connect(str(root / "window.sqlite3"))
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=MEMORY")
+        conn.execute("PRAGMA cache_size=-2048")
+        conn.execute(
+            "CREATE TABLE window_counts (key INTEGER PRIMARY KEY, total INTEGER NOT NULL)")
+        conn.execute(
+            "CREATE TABLE shard_counts (shard INTEGER NOT NULL, key INTEGER NOT NULL, "
+            "count INTEGER NOT NULL, PRIMARY KEY (shard, key)) WITHOUT ROWID")
+        conn.execute(
+            "CREATE TABLE reserve_counts (key INTEGER PRIMARY KEY, total INTEGER NOT NULL)")
+        # One ascending pass over the per-shard sorted spills gives the global
+        # distinct-key counts and each shard's attribution in a single sweep;
+        # only integer count rows are ever loaded, never payloads.
+        readers = [_LineReader(path) for path in spill_paths]
+        try:
+            with conn:
+                # Per-shard per-key counts: a key may occupy several run files
+                # of one shard, so the aggregation is completed in SQL.
+                for shard, reader in enumerate(readers):
+                    while True:
+                        line = reader.peek()
+                        if line is None:
+                            break
+                        key = _line_key(line)
+                        count = 0
+                        while True:
+                            reader.pop()
+                            count += 1
+                            line = reader.peek()
+                            if line is None or _line_key(line) != key:
+                                break
+                        conn.execute(
+                            "INSERT INTO shard_counts(shard, key, count) "
+                            "VALUES (?, ?, ?) ON CONFLICT(shard, key) "
+                            "DO UPDATE SET count = count + excluded.count",
+                            (shard, key, count))
+                # Global distinct-key counts follow in one grouped sweep;
+                # every row of a key lives in exactly one shard, so the
+                # per-shard counts partition the global total without overlap.
+                conn.execute(
+                    "INSERT INTO window_counts(key, total) "
+                    "SELECT key, SUM(count) FROM shard_counts GROUP BY key")
+        finally:
+            for reader in readers:
+                reader.close()
+
+        batch = _PartitionedBatch(
+            tempdir, root, conn, spill_paths, preceding, carry_keys)
+        yield batch
+    finally:
+        # batch.close() is idempotent and owns the connection and temp dir;
+        # build-phase failures (batch is still None) are cleaned directly.
+        if batch is not None:
+            batch.close()
+        else:
+            if conn is not None:
+                conn.close()
+            tempdir.cleanup()
